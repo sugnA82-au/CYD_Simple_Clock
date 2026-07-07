@@ -1,0 +1,4 @@
+.pio/
+.DS_Store
+# Real WiFi credentials live here; copy include/config.h.example to get started
+include/config.h

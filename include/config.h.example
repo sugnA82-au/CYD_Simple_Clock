@@ -1,8 +1,10 @@
 #pragma once
 
+// Copy this file to include/config.h and fill in your details.
+
 // ---- Edit these before flashing ----
-#define WIFI_SSID     "xxxx"
-#define WIFI_PASSWORD "xxxx"
+#define WIFI_SSID     "YOUR_WIFI_SSID"
+#define WIFI_PASSWORD "YOUR_WIFI_PASSWORD"
 
 // POSIX timezone string (handles DST automatically).
 // Europe/London:   "GMT0BST,M3.5.0/1,M10.5.0"
