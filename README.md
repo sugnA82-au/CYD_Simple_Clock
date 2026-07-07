@@ -6,7 +6,8 @@ Display (ESP32-2432S028R, 2.8" ILI9341). Syncs with NTP over WiFi every
 
 ## Setup
 
-1. Edit `include/config.h` — set your WiFi SSID/password and timezone.
+1. Copy `include/config.h.example` to `include/config.h` and set your
+   WiFi SSID/password and timezone.
 2. Build and flash:
 
    ```sh
