@@ -6,9 +6,11 @@
 //   - Touch (XPT2046) on its own HSPI bus
 //   - LDR auto-brightness on GPIO 34 -> backlight PWM on GPIO 21
 //
-// Pages: tap the top-left corner of the screen to switch between the clock
-// and the pomodoro timer. The pomodoro keeps running while the clock page
-// is shown and pulls the display back to itself when a session ends.
+// Pages: tap the top-left corner of the screen to cycle through the clock,
+// the weather page and the pomodoro timer. The pomodoro keeps running while
+// other pages are shown and pulls the display back to itself when a session
+// ends. The weather page (Open-Meteo, no API key) refreshes piggybacked on
+// each NTP sync so the device only wakes the network once per interval.
 //
 // Flicker-free rendering: the time and date are each drawn into an off-screen
 // sprite (framebuffer in RAM) and pushed to the panel in a single SPI burst,
@@ -20,6 +22,8 @@
 
 #include <Arduino.h>
 #include <WiFi.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
 #include <time.h>
 #include "esp_sntp.h"
 #include <TFT_eSPI.h>
@@ -84,9 +88,14 @@ volatile time_t lastSyncTime = 0;
 float smoothedLight = 0;      // For animation/smoothing
 uint32_t boostUntil = 0;      // millis() deadline for touch brightness boost
 
-// PAGES
-enum Page { PAGE_CLOCK, PAGE_POMO };
+// PAGES (top-left corner tap cycles CLOCK -> WEATHER -> POMO -> CLOCK)
+enum Page { PAGE_CLOCK, PAGE_WEATHER, PAGE_POMO };
 Page page = PAGE_CLOCK;
+
+// Weather fetch request flag; set by the NTP sync callback so the weather
+// refresh rides the same 15-minute network cadence, and by a tap on the
+// weather page for a manual refresh (rate-limited in weatherService()).
+volatile bool wxFetchPending = false;
 
 // Clock page redraw state (reset on page switch to force a full redraw)
 int clockLastSec = -1;
@@ -127,6 +136,7 @@ float pomoScaleMax = 1.2f; // fill scale for the current string width
 
 void onNtpSync(struct timeval *) {
   time(const_cast<time_t *>(&lastSyncTime));
+  wxFetchPending = true;  // refresh weather on the same 15 min beat
   Serial.println("NTP sync OK");
 }
 
@@ -269,6 +279,490 @@ void clockLoop() {
     drawTime(t, t.tm_sec % 2 == 0);  // colon blinks once per second
     drawStatusDot();
   }
+}
+
+// -------------------------------------------------------------- weather page
+//
+// Data comes from Open-Meteo (free, no API key) over plain HTTP for
+// Kootingal NSW 2352. One request returns the current conditions, a 12-hour
+// rain-probability window and a 4-day daily forecast (~2 KB of JSON).
+// Icons are drawn from graphics primitives so they scale between the hero
+// (64 px) and the forecast strip (26 px).
+
+constexpr float WX_LAT = -31.06f;
+constexpr float WX_LON = 151.05f;
+static const char *WX_NAME = "KOOTINGAL";
+
+// Extra colours for the weather art
+constexpr uint16_t COL_SUN      = 0xFEA0;  // warm yellow
+constexpr uint16_t COL_MOON     = 0xCE9C;  // pale silver
+constexpr uint16_t COL_CLOUD    = 0xB5F9;  // light grey-blue cloud
+constexpr uint16_t COL_CLOUD_DK = 0x5B2E;  // dark storm cloud
+constexpr uint16_t COL_RAIN     = 0x3D1F;  // rain blue
+constexpr uint16_t COL_SNOWF    = 0xE73C;  // snowflake white
+constexpr uint16_t COL_BOLT     = 0xFFE0;  // lightning yellow
+constexpr uint16_t COL_WXTEXT   = 0xE71C;  // bright grey: readable when dimmed
+
+struct WxData {
+  bool valid = false;
+  time_t fetchedAt = 0;
+  float temp = 0, feels = 0, wind = 0, uvMax = 0;
+  int hum = 0, code = 0, windDir = 0;
+  bool isDay = true;
+  float hiT[4], loT[4];        // daily max/min, [0] = today
+  int dCode[4], dPop[4];       // daily weather code / max rain probability
+  char dayLbl[4][6];           // "TODAY", "FRI", ...
+  int rainHour = -1;           // first hour (0-23) with pop >= 40% in next 12 h
+  int rainPop = 0;
+};
+WxData wx;
+
+int wxLastMin = -1;  // header clock minute currently on screen
+
+enum WxIcon { WI_SUN, WI_PARTLY, WI_CLOUD, WI_FOG, WI_DRIZZLE, WI_RAIN,
+              WI_SNOW, WI_STORM };
+
+// WMO weather interpretation codes -> icon / text
+WxIcon wxIconFor(int code) {
+  if (code == 0) return WI_SUN;
+  if (code <= 2) return WI_PARTLY;
+  if (code == 3) return WI_CLOUD;
+  if (code == 45 || code == 48) return WI_FOG;
+  if (code >= 51 && code <= 57) return WI_DRIZZLE;
+  if (code >= 61 && code <= 67) return WI_RAIN;
+  if (code >= 71 && code <= 77) return WI_SNOW;
+  if (code >= 80 && code <= 82) return WI_RAIN;
+  if (code == 85 || code == 86) return WI_SNOW;
+  if (code >= 95) return WI_STORM;
+  return WI_CLOUD;
+}
+
+const char *wxTextFor(int code) {
+  switch (code) {
+    case 0:  return "Clear";
+    case 1:  return "Mostly clear";
+    case 2:  return "Partly cloudy";
+    case 3:  return "Overcast";
+    case 45: case 48: return "Fog";
+    case 51: case 53: case 55: return "Drizzle";
+    case 56: case 57: return "Freezing drizzle";
+    case 61: return "Light rain";
+    case 63: return "Rain";
+    case 65: return "Heavy rain";
+    case 66: case 67: return "Freezing rain";
+    case 71: return "Light snow";
+    case 73: return "Snow";
+    case 75: return "Heavy snow";
+    case 77: return "Snow grains";
+    case 80: return "Light showers";
+    case 81: return "Showers";
+    case 82: return "Heavy showers";
+    case 85: case 86: return "Snow showers";
+    case 95: return "Thunderstorm";
+    case 96: case 99: return "Storm with hail";
+    default: return "Unknown";
+  }
+}
+
+const char *wxCompass(int deg) {
+  static const char *DIRS[] = {"N", "NE", "E", "SE", "S", "SW", "W", "NW"};
+  return DIRS[((deg + 23) / 45) & 7];
+}
+
+uint16_t wxUvColour(float uv) {  // standard UV index bands
+  if (uv < 3)  return COL_OK;
+  if (uv < 6)  return 0xFFE0;    // yellow
+  if (uv < 8)  return COL_ACCENT;
+  if (uv < 11) return COL_ERR;
+  return 0xB81F;                 // extreme: violet
+}
+
+// ---- icon drawing primitives (all sized as fractions of s) ----
+
+void drawThickLine(int x0, int y0, int x1, int y1, uint16_t col) {
+  tft.drawLine(x0, y0, x1, y1, col);
+  tft.drawLine(x0 + 1, y0, x1 + 1, y1, col);
+  tft.drawLine(x0, y0 + 1, x1, y1 + 1, col);
+}
+
+void drawSunShape(int cx, int cy, int s) {
+  int r = s * 28 / 100;
+  tft.fillCircle(cx, cy, r, COL_SUN);
+  for (int i = 0; i < 8; i++) {
+    float a = i * (PI / 4.0f);
+    float ca = cosf(a), sa = sinf(a);
+    int r0 = r + s * 7 / 100, r1 = r + s * 17 / 100;
+    drawThickLine(cx + (int)(ca * r0), cy + (int)(sa * r0),
+                  cx + (int)(ca * r1), cy + (int)(sa * r1), COL_SUN);
+  }
+}
+
+void drawMoonShape(int cx, int cy, int s) {
+  int r = s * 30 / 100;
+  tft.fillCircle(cx, cy, r, COL_MOON);
+  tft.fillCircle(cx + r * 5 / 8, cy - r * 3 / 8, r * 7 / 8, COL_BG);  // bite
+}
+
+void drawCloudShape(int cx, int cy, int s, uint16_t col) {
+  tft.fillCircle(cx - s * 18 / 100, cy - s * 2 / 100, s * 20 / 100, col);
+  tft.fillCircle(cx + s * 10 / 100, cy - s * 12 / 100, s * 26 / 100, col);
+  tft.fillRoundRect(cx - s * 38 / 100, cy - s * 2 / 100,
+                    s * 76 / 100, s * 18 / 100, s * 9 / 100, col);
+}
+
+void drawFlakeShape(int x, int y, int r, uint16_t col) {
+  tft.drawLine(x - r, y, x + r, y, col);
+  tft.drawLine(x, y - r, x, y + r, col);
+  tft.drawLine(x - r * 7 / 10, y - r * 7 / 10, x + r * 7 / 10, y + r * 7 / 10, col);
+  tft.drawLine(x - r * 7 / 10, y + r * 7 / 10, x + r * 7 / 10, y - r * 7 / 10, col);
+}
+
+void drawWxIcon(int cx, int cy, int s, WxIcon k, bool day) {
+  switch (k) {
+    case WI_SUN:
+      if (day) drawSunShape(cx, cy, s);
+      else     drawMoonShape(cx, cy, s);
+      break;
+    case WI_PARTLY:
+      if (day) drawSunShape(cx + s * 16 / 100, cy - s * 14 / 100, s * 62 / 100);
+      else     drawMoonShape(cx + s * 16 / 100, cy - s * 14 / 100, s * 62 / 100);
+      drawCloudShape(cx - s * 4 / 100, cy + s * 8 / 100, s * 88 / 100, COL_CLOUD);
+      break;
+    case WI_CLOUD:
+      drawCloudShape(cx + s * 12 / 100, cy - s * 12 / 100, s * 78 / 100, COL_CLOUD_DK);
+      drawCloudShape(cx - s * 4 / 100, cy + s * 6 / 100, s * 92 / 100, COL_CLOUD);
+      break;
+    case WI_FOG:
+      drawCloudShape(cx, cy - s * 12 / 100, s * 80 / 100, COL_CLOUD_DK);
+      for (int i = 0; i < 3; i++) {
+        int w = s * (64 - i * 14) / 100;
+        int lx = cx - w / 2 + (i % 2 ? s * 6 / 100 : -(s * 4 / 100));
+        int ly = cy + s * (10 + i * 10) / 100;
+        tft.drawFastHLine(lx, ly, w, COL_CLOUD);
+        tft.drawFastHLine(lx, ly + 1, w, COL_CLOUD);
+      }
+      break;
+    case WI_DRIZZLE:
+      drawCloudShape(cx, cy - s * 10 / 100, s * 85 / 100, COL_CLOUD);
+      for (int i = 0; i < 3; i++)
+        tft.fillCircle(cx - s * 16 / 100 + i * s * 16 / 100,
+                       cy + s * (16 + (i % 2) * 8) / 100,
+                       s > 40 ? 2 : 1, COL_RAIN);
+      break;
+    case WI_RAIN:
+      drawCloudShape(cx, cy - s * 10 / 100, s * 85 / 100, COL_CLOUD);
+      for (int i = 0; i < 3; i++) {
+        int bx = cx - s * 16 / 100 + i * s * 16 / 100;
+        tft.drawLine(bx, cy + s * 14 / 100,
+                     bx - s * 6 / 100, cy + s * 30 / 100, COL_RAIN);
+        tft.drawLine(bx + 1, cy + s * 14 / 100,
+                     bx + 1 - s * 6 / 100, cy + s * 30 / 100, COL_RAIN);
+      }
+      break;
+    case WI_SNOW: {
+      drawCloudShape(cx, cy - s * 10 / 100, s * 85 / 100, COL_CLOUD);
+      int fr = s * 6 / 100; if (fr < 2) fr = 2;
+      for (int i = 0; i < 3; i++)
+        drawFlakeShape(cx - s * 18 / 100 + i * s * 18 / 100,
+                       cy + s * (20 + (i % 2) * 6) / 100, fr, COL_SNOWF);
+      break;
+    }
+    case WI_STORM: {
+      drawCloudShape(cx, cy - s * 10 / 100, s * 88 / 100, COL_CLOUD_DK);
+      int u = s / 32; if (u < 1) u = 1;
+      drawThickLine(cx + 3 * u, cy + 2 * u, cx - u, cy + 6 * u, COL_BOLT);
+      drawThickLine(cx - u, cy + 6 * u, cx + 2 * u, cy + 6 * u, COL_BOLT);
+      drawThickLine(cx + 2 * u, cy + 6 * u, cx - 3 * u, cy + 11 * u, COL_BOLT);
+      break;
+    }
+  }
+}
+
+// Hand-drawn degree symbol (the built-in fonts have no reliable glyph)
+void drawDegreeMark(int x, int y, int r, uint16_t col) {
+  tft.drawCircle(x, y, r, col);
+  if (r > 2) tft.drawCircle(x, y, r - 1, col);
+}
+
+// ---- fetch & parse ----
+
+bool fetchWeather() {
+  char url[560];
+  snprintf(url, sizeof(url),
+           "http://api.open-meteo.com/v1/forecast?latitude=%.4f&longitude=%.4f"
+           "&current=temperature_2m,relative_humidity_2m,apparent_temperature,"
+           "is_day,weather_code,wind_speed_10m,wind_direction_10m"
+           "&hourly=precipitation_probability&forecast_hours=12"
+           "&daily=weather_code,temperature_2m_max,temperature_2m_min,"
+           "precipitation_probability_max,uv_index_max"
+           "&forecast_days=4&timezone=auto",
+           WX_LAT, WX_LON);
+
+  HTTPClient http;
+  http.setConnectTimeout(5000);
+  http.setTimeout(7000);
+  if (!http.begin(url)) return false;
+  int rc = http.GET();
+  if (rc != HTTP_CODE_OK) {
+    Serial.printf("wx: HTTP %d\n", rc);
+    http.end();
+    return false;
+  }
+  String body = http.getString();
+  http.end();
+
+  JsonDocument doc;
+  DeserializationError err = deserializeJson(doc, body);
+  if (err) {
+    Serial.printf("wx: JSON %s\n", err.c_str());
+    return false;
+  }
+
+  JsonObject cur = doc["current"];
+  wx.temp    = cur["temperature_2m"] | 0.0f;
+  wx.feels   = cur["apparent_temperature"] | 0.0f;
+  wx.hum     = cur["relative_humidity_2m"] | 0;
+  wx.code    = cur["weather_code"] | 0;
+  wx.isDay   = (cur["is_day"] | 1) != 0;
+  wx.wind    = cur["wind_speed_10m"] | 0.0f;
+  wx.windDir = cur["wind_direction_10m"] | 0;
+
+  JsonObject d = doc["daily"];
+  wx.uvMax = d["uv_index_max"][0] | 0.0f;
+  static const char *DAYS_UP[] = {"SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"};
+  for (int i = 0; i < 4; i++) {
+    wx.hiT[i]   = d["temperature_2m_max"][i] | 0.0f;
+    wx.loT[i]   = d["temperature_2m_min"][i] | 0.0f;
+    wx.dCode[i] = d["weather_code"][i] | 0;
+    wx.dPop[i]  = d["precipitation_probability_max"][i] | 0;
+    if (i == 0) {
+      strcpy(wx.dayLbl[0], "TODAY");
+    } else {
+      int yy, mo, dd;
+      const char *ds = d["time"][i] | "";
+      if (sscanf(ds, "%d-%d-%d", &yy, &mo, &dd) == 3) {
+        tm td = {};
+        td.tm_year = yy - 1900; td.tm_mon = mo - 1; td.tm_mday = dd;
+        td.tm_hour = 12;
+        mktime(&td);  // fills tm_wday
+        strcpy(wx.dayLbl[i], DAYS_UP[td.tm_wday]);
+      } else {
+        strcpy(wx.dayLbl[i], "---");
+      }
+    }
+  }
+
+  // first hour in the next 12 with a real chance of rain
+  wx.rainHour = -1;
+  wx.rainPop = 0;
+  JsonArray hPop = doc["hourly"]["precipitation_probability"];
+  JsonArray hTime = doc["hourly"]["time"];
+  for (size_t i = 0; i < hPop.size() && i < hTime.size(); i++) {
+    int p = hPop[i] | 0;
+    if (p >= 40) {
+      const char *ts = hTime[i] | "";        // "2026-07-09T14:00"
+      if (strlen(ts) >= 13) wx.rainHour = atoi(ts + 11);
+      wx.rainPop = p;
+      break;
+    }
+  }
+
+  wx.valid = true;
+  wx.fetchedAt = time(nullptr);
+  Serial.printf("wx: %.1fC code %d pop %d%%\n", wx.temp, wx.code, wx.dPop[0]);
+  return true;
+}
+
+// ---- page drawing ----
+
+void drawWxHeaderClock() {
+  time_t now = time(nullptr);
+  tm t;
+  localtime_r(&now, &t);
+  if (t.tm_year < 100) return;
+  wxLastMin = t.tm_min;
+  int h12 = t.tm_hour % 12;
+  if (h12 == 0) h12 = 12;
+  char buf[12];
+  snprintf(buf, sizeof(buf), "%d:%02d %s", h12, t.tm_min,
+           t.tm_hour < 12 ? "AM" : "PM");
+  tft.fillRect(240, 0, 80, 20, COL_BG);
+  tft.setTextFont(2);
+  tft.setTextDatum(TR_DATUM);
+  tft.setTextColor(COL_WXTEXT, COL_BG);
+  tft.drawString(buf, 312, 6);
+}
+
+// Centred row of small stats: feels-like / humidity / wind / UV (colour-coded)
+void drawWxStatsRow(int y) {
+  char fs[16], hs[16], ws[24], us[12];
+  snprintf(fs, sizeof(fs), "Feels %.0f", wx.feels);
+  snprintf(hs, sizeof(hs), "Hum %d%%", wx.hum);
+  snprintf(ws, sizeof(ws), "%s %.0f km/h", wxCompass(wx.windDir), wx.wind);
+  snprintf(us, sizeof(us), "UV %.0f", wx.uvMax);
+  const char *txt[4] = {fs, hs, ws, us};
+  uint16_t col[4] = {COL_WXTEXT, COL_WXTEXT, COL_WXTEXT, wxUvColour(wx.uvMax)};
+
+  tft.setTextFont(2);
+  tft.setTextDatum(ML_DATUM);
+  const int gap = 14, degW = 5;
+  int w[4], total = degW + gap * 3;
+  for (int i = 0; i < 4; i++) { w[i] = tft.textWidth(txt[i]); total += w[i]; }
+
+  int x = (SCR_W - total) / 2;
+  for (int i = 0; i < 4; i++) {
+    tft.setTextColor(col[i], COL_BG);
+    tft.drawString(txt[i], x, y);
+    x += w[i];
+    if (i == 0) {  // degree mark after the feels-like value
+      drawDegreeMark(x + 2, y - 5, 2, COL_WXTEXT);
+      x += degW;
+    }
+    if (i < 3) {
+      tft.fillCircle(x + gap / 2, y, 1, COL_COLON_OFF);
+      x += gap;
+    }
+  }
+}
+
+// One row of the right-hand column: direction triangle + value + degree mark,
+// centred as a unit on cx.
+void drawWxHiLoRow(int cx, int y, float v, bool isHi) {
+  char b[8];
+  snprintf(b, sizeof(b), "%.0f", v);
+  tft.setTextFont(4);
+  int tw = tft.textWidth(b);
+  int x = cx - (14 + tw + 8) / 2;
+  uint16_t col = isHi ? COL_TIME : COL_WXTEXT;
+  if (isHi) tft.fillTriangle(x + 5, y - 6, x, y + 4, x + 10, y + 4, COL_ACCENT);
+  else      tft.fillTriangle(x + 5, y + 4, x, y - 6, x + 10, y - 6, COL_RAIN);
+  tft.setTextDatum(ML_DATUM);
+  tft.setTextColor(col, COL_BG);
+  tft.drawString(b, x + 14, y);
+  drawDegreeMark(x + 14 + tw + 4, y - 7, 3, col);
+}
+
+void drawWeatherPage() {
+  tft.fillScreen(COL_BG);
+
+  // header: nav hint, location, live clock
+  tft.setTextFont(2);
+  tft.setTextDatum(TL_DATUM);
+  tft.setTextColor(COL_COLON_OFF, COL_BG);
+  tft.drawString("< TIMER", 8, 6);
+  tft.setTextDatum(TC_DATUM);
+  tft.setTextColor(COL_WXTEXT, COL_BG);
+  tft.drawString(WX_NAME, SCR_W / 2, 6);
+  drawWxHeaderClock();
+
+  if (!wx.valid) {
+    tft.setTextFont(4);
+    tft.setTextDatum(MC_DATUM);
+    tft.setTextColor(COL_DATE, COL_BG);
+    tft.drawString("Fetching weather...", SCR_W / 2, SCR_H / 2 - 10);
+    tft.setTextFont(2);
+    tft.setTextColor(COL_COLON_OFF, COL_BG);
+    tft.drawString("tap to retry", SCR_W / 2, SCR_H / 2 + 16);
+    return;
+  }
+
+  // hero band: big icon and big temperature (font 8 at y=64 spans y 27-102)
+  drawWxIcon(48, 64, 64, wxIconFor(wx.code), wx.isDay);
+
+  char buf[16];
+  snprintf(buf, sizeof(buf), "%.0f", wx.temp);
+  tft.setTextFont(8);
+  tft.setTextDatum(ML_DATUM);
+  tft.setTextColor(COL_TIME, COL_BG);
+  int tw = tft.drawString(buf, 98, 64);
+  drawDegreeMark(98 + tw + 10, 34, 7, COL_TIME);
+
+  // right-hand column, everything centred on one axis: today's hi/lo,
+  // the rain outlook (two short lines) and the UV index
+  constexpr int RCOL_X = 282;
+  drawWxHiLoRow(RCOL_X, 42, wx.hiT[0], true);
+  drawWxHiLoRow(RCOL_X, 72, wx.loT[0], false);
+
+  char l1[16], l2[16];
+  uint16_t rainCol = COL_WXTEXT;
+  if (wx.rainHour >= 0) {
+    int h12 = wx.rainHour % 12;
+    if (h12 == 0) h12 = 12;
+    snprintf(l1, sizeof(l1), "Rain %d%%", wx.rainPop);
+    snprintf(l2, sizeof(l2), "at %d %s", h12, wx.rainHour < 12 ? "AM" : "PM");
+    rainCol = COL_RAIN;
+  } else if (wx.dPop[0] >= 20) {
+    snprintf(l1, sizeof(l1), "Rain %d%%", wx.dPop[0]);
+    snprintf(l2, sizeof(l2), "today");
+  } else {
+    snprintf(l1, sizeof(l1), "No rain");
+    snprintf(l2, sizeof(l2), "expected");
+  }
+  tft.setTextFont(2);
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextColor(rainCol, COL_BG);
+  tft.drawString(l1, RCOL_X, 102);
+  tft.drawString(l2, RCOL_X, 118);
+
+  // condition text (font 4, 26 px: y 108-134, clear of the right column)
+  tft.setTextFont(4);
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextColor(COL_TIME, COL_BG);
+  tft.drawString(wxTextFor(wx.code), SCR_W / 2, 121);
+
+  drawWxStatsRow(148);                   // y 140-156
+
+  tft.drawFastHLine(12, 161, SCR_W - 24, COL_COLON_OFF);
+
+  // 4-day forecast strip (labels y 163-179, icons to ~207, temps y 209-225,
+  // rain odds y 223-239)
+  tft.setTextFont(2);
+  for (int i = 0; i < 4; i++) {
+    int cx = 40 + i * 80;
+    tft.setTextDatum(MC_DATUM);
+    tft.setTextColor(i == 0 ? COL_ACCENT : COL_WXTEXT, COL_BG);
+    tft.drawString(wx.dayLbl[i], cx, 171);
+    drawWxIcon(cx, 195, 26, wxIconFor(wx.dCode[i]), true);
+
+    char hb[8], lb[8];
+    snprintf(hb, sizeof(hb), "%.0f", wx.hiT[i]);
+    snprintf(lb, sizeof(lb), "%.0f", wx.loT[i]);
+    int w1 = tft.textWidth(hb), w2 = tft.textWidth(lb);
+    int x0 = cx - (w1 + 8 + w2) / 2;
+    tft.setTextDatum(ML_DATUM);
+    tft.setTextColor(COL_TIME, COL_BG);
+    tft.drawString(hb, x0, 217);
+    tft.setTextColor(COL_WXTEXT, COL_BG);
+    tft.drawString(lb, x0 + w1 + 8, 217);
+
+    snprintf(hb, sizeof(hb), "%d%%", wx.dPop[i]);
+    tft.setTextDatum(MC_DATUM);
+    tft.setTextColor(wx.dPop[i] >= 20 ? COL_RAIN : COL_WXTEXT, COL_BG);
+    tft.drawString(hb, cx, 231);
+  }
+}
+
+// Keep the header clock ticking while the weather page is shown.
+void weatherLoop() {
+  time_t now = time(nullptr);
+  tm t;
+  localtime_r(&now, &t);
+  if (t.tm_year >= 100 && t.tm_min != wxLastMin) drawWxHeaderClock();
+}
+
+// Runs every loop pass: performs a pending fetch (set by the NTP sync
+// callback or a tap), retries until the first success, and re-fetches if the
+// data somehow goes stale. Attempts are spaced at least 60 s apart.
+void weatherService() {
+  static uint32_t lastAttemptMs = 0;
+  bool retryFirst = !wx.valid && lastSyncTime != 0;
+  bool stale = wx.valid && time(nullptr) - wx.fetchedAt > 40 * 60;
+  if (!wxFetchPending && !retryFirst && !stale) return;
+  if (WiFi.status() != WL_CONNECTED) return;
+  if (lastAttemptMs != 0 && millis() - lastAttemptMs < 60000UL) return;
+  lastAttemptMs = millis();
+  wxFetchPending = false;
+  if (fetchWeather() && page == PAGE_WEATHER) drawWeatherPage();
 }
 
 // ------------------------------------------------------------- pomodoro page
@@ -509,6 +1003,9 @@ void pomoLoop() {
 
 void switchPage() {
   if (page == PAGE_CLOCK) {
+    page = PAGE_WEATHER;
+    drawWeatherPage();
+  } else if (page == PAGE_WEATHER) {
     page = PAGE_POMO;
     drawPomoPage();
   } else {
@@ -544,6 +1041,8 @@ void handleTouch() {
     return;
   }
   if (page == PAGE_POMO) handlePomoTap(x, y);
+  // tap anywhere on the weather page = manual refresh (rate-limited)
+  else if (page == PAGE_WEATHER) wxFetchPending = true;
 }
 
 // LDR auto-brightness (see "CYD Display Dimming" notes).
@@ -656,9 +1155,12 @@ void loop() {
   handleTouch();
   updateBrightness();
   tickPomodoro();
+  weatherService();
 
   if (page == PAGE_CLOCK) {
     clockLoop();
+  } else if (page == PAGE_WEATHER) {
+    weatherLoop();
   } else {
     pomoLoop();
   }

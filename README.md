@@ -1,8 +1,26 @@
 # CYD NTP Clock
 
-A simple, flicker-free 12-hour clock with date for the ESP32 Cheap Yellow
-Display (ESP32-2432S028R, 2.8" ILI9341). Syncs with NTP over WiFi every
-15 minutes; handles DST automatically via the POSIX timezone string.
+A simple, flicker-free 12-hour clock with date, weather and a pomodoro timer
+for the ESP32 Cheap Yellow Display (ESP32-2432S028R, 2.8" ILI9341). Syncs
+with NTP over WiFi every 15 minutes; handles DST automatically via the POSIX
+timezone string.
+
+## Pages
+
+Tap the top-left corner of the screen to cycle: clock -> weather -> pomodoro.
+
+- **Clock** — big 12-hour time with blinking colon, date, and a sync-health
+  dot.
+- **Weather** — current conditions from [Open-Meteo](https://open-meteo.com)
+  (free, no API key): temperature, condition icon (day/night aware), today's
+  hi/lo, a rain outlook for the next 12 hours, feels-like / humidity / wind /
+  colour-coded UV, and a 4-day forecast strip. Refreshes on the same
+  15-minute beat as the NTP sync to keep network traffic down; tap the page
+  to force a refresh (rate-limited to once a minute). Location is set by
+  `WX_LAT` / `WX_LON` / `WX_NAME` in `main.cpp`.
+- **Pomodoro** — 15/25/45/60-minute work sessions with a 5-minute break.
+  It keeps counting while other pages are shown and pulls the display back
+  to itself (with a full-screen flash) when a session ends.
 
 ## Setup
 
