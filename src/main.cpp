@@ -669,13 +669,17 @@ void drawWeatherPage() {
   // hero band: big icon and big temperature (font 8 at y=64 spans y 27-102)
   drawWxIcon(48, 64, 64, wxIconFor(wx.code), wx.isDay);
 
+  // temp + degree mark centred as a unit between the icon and right column
   char buf[16];
   snprintf(buf, sizeof(buf), "%.0f", wx.temp);
   tft.setTextFont(8);
   tft.setTextDatum(ML_DATUM);
   tft.setTextColor(COL_TIME, COL_BG);
-  int tw = tft.drawString(buf, 98, 64);
-  drawDegreeMark(98 + tw + 10, 34, 7, COL_TIME);
+  int tw = tft.textWidth(buf);
+  int tx = (98 + 246) / 2 - (tw + 24) / 2;  // 24 = gap + degree mark width
+  if (tx < 98) tx = 98;
+  tft.drawString(buf, tx, 64);
+  drawDegreeMark(tx + tw + 10, 34, 7, COL_TIME);
 
   // right-hand column, everything centred on one axis: today's hi/lo,
   // the rain outlook (two short lines) and the UV index
