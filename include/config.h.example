@@ -6,6 +6,14 @@
 #define WIFI_SSID     "YOUR_WIFI_SSID"
 #define WIFI_PASSWORD "YOUR_WIFI_PASSWORD"
 
+// Optional static IP. Set USE_STATIC_IP to 0 to use DHCP.
+#define USE_STATIC_IP  0
+#define STATIC_IP      IPAddress(192, 168, 1, 69)
+#define STATIC_GATEWAY IPAddress(192, 168, 1, 1)
+#define STATIC_SUBNET  IPAddress(255, 255, 255, 0)
+#define STATIC_DNS1    IPAddress(192, 168, 1, 1)   // router
+#define STATIC_DNS2    IPAddress(8, 8, 8, 8)       // public fallback
+
 // POSIX timezone string (handles DST automatically).
 // Europe/London:   "GMT0BST,M3.5.0/1,M10.5.0"
 // US Eastern:      "EST5EDT,M3.2.0,M11.1.0"
@@ -14,5 +22,8 @@
 // Full list: https://github.com/nayarsystems/posix_tz_db/blob/master/zones.csv
 #define TZ_INFO "AEST-10AEDT,M10.1.0,M4.1.0/3"
 
-#define NTP_SERVER1 "time.google.com"
+// NTP_SERVER1 can be your router's LAN IP (works even if the network blocks
+// external DNS/NTP); NTP_SERVER2 is an internet fallback.
+#define NTP_SERVER1 "192.168.1.1"
+#define NTP_SERVER2 "time.google.com"
 #define NTP_SYNC_INTERVAL_MIN 15

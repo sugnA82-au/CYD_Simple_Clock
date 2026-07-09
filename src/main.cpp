@@ -578,6 +578,12 @@ void setup() {
   showMessage("Connecting to WiFi...");
   WiFi.mode(WIFI_STA);
   WiFi.setAutoReconnect(true);
+#if USE_STATIC_IP
+  if (!WiFi.config(STATIC_IP, STATIC_GATEWAY, STATIC_SUBNET,
+                   STATIC_DNS1, STATIC_DNS2)) {
+    Serial.println("WiFi.config (static IP) FAILED");
+  }
+#endif
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
   uint32_t start = millis();
@@ -614,11 +620,12 @@ void setup() {
   }
 
   // SNTP: sync now and every NTP_SYNC_INTERVAL_MIN minutes thereafter.
-  // Fallbacks: pool.ntp.org, and a Google time server by raw IP so time
-  // still syncs even if DNS is broken on this network.
+  // NTP_SERVER1 is typically the router (LAN, no DNS/WAN needed); NTP_SERVER2
+  // is an internet fallback; 216.239.35.4 is a Google time server by raw IP so
+  // time still syncs even if DNS is broken on this network.
   sntp_set_sync_interval(NTP_SYNC_INTERVAL_MIN * 60 * 1000UL);
   sntp_set_time_sync_notification_cb(onNtpSync);
-  configTzTime(TZ_INFO, NTP_SERVER1, "pool.ntp.org", "216.239.35.4");
+  configTzTime(TZ_INFO, NTP_SERVER1, NTP_SERVER2, "216.239.35.4");
 
   showMessage("Waiting for time sync...");
 }
