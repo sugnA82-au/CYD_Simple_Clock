@@ -306,7 +306,7 @@ constexpr uint16_t COL_WXTEXT   = 0xE71C;  // bright grey: readable when dimmed
 struct WxData {
   bool valid = false;
   time_t fetchedAt = 0;
-  float temp = 0, feels = 0, wind = 0, uvMax = 0;
+  float temp = 0, feels = 0, wind = 0, uvNow = 0;
   int hum = 0, code = 0, windDir = 0;
   bool isDay = true;
   float hiT[4], loT[4];        // daily max/min, [0] = today
@@ -491,10 +491,10 @@ bool fetchWeather() {
   snprintf(url, sizeof(url),
            "http://api.open-meteo.com/v1/forecast?latitude=%.4f&longitude=%.4f"
            "&current=temperature_2m,relative_humidity_2m,apparent_temperature,"
-           "is_day,weather_code,wind_speed_10m,wind_direction_10m"
+           "is_day,weather_code,wind_speed_10m,wind_direction_10m,uv_index"
            "&hourly=precipitation_probability&forecast_hours=12"
            "&daily=weather_code,temperature_2m_max,temperature_2m_min,"
-           "precipitation_probability_max,uv_index_max"
+           "precipitation_probability_max"
            "&forecast_days=4&timezone=auto",
            WX_LAT, WX_LON);
 
@@ -526,9 +526,9 @@ bool fetchWeather() {
   wx.isDay   = (cur["is_day"] | 1) != 0;
   wx.wind    = cur["wind_speed_10m"] | 0.0f;
   wx.windDir = cur["wind_direction_10m"] | 0;
+  wx.uvNow   = cur["uv_index"] | 0.0f;
 
   JsonObject d = doc["daily"];
-  wx.uvMax = d["uv_index_max"][0] | 0.0f;
   static const char *DAYS_UP[] = {"SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"};
   for (int i = 0; i < 4; i++) {
     wx.hiT[i]   = d["temperature_2m_max"][i] | 0.0f;
@@ -599,9 +599,9 @@ void drawWxStatsRow(int y) {
   snprintf(fs, sizeof(fs), "Feels %.0f", wx.feels);
   snprintf(hs, sizeof(hs), "Hum %d%%", wx.hum);
   snprintf(ws, sizeof(ws), "%s %.0f km/h", wxCompass(wx.windDir), wx.wind);
-  snprintf(us, sizeof(us), "UV %.0f", wx.uvMax);
+  snprintf(us, sizeof(us), "UV %.0f", wx.uvNow);
   const char *txt[4] = {fs, hs, ws, us};
-  uint16_t col[4] = {COL_WXTEXT, COL_WXTEXT, COL_WXTEXT, wxUvColour(wx.uvMax)};
+  uint16_t col[4] = {COL_WXTEXT, COL_WXTEXT, COL_WXTEXT, wxUvColour(wx.uvNow)};
 
   tft.setTextFont(2);
   tft.setTextDatum(ML_DATUM);
