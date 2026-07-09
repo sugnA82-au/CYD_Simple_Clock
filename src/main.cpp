@@ -132,6 +132,16 @@ void onNtpSync(struct timeval *) {
 
 // ---------------------------------------------------------------- clock page
 
+// Clock digits are pushed through the sprite scaler (below) so they render a
+// bit larger than font 8's native 75px. The scale is the largest uniform
+// factor that still fits the widest possible string ("12:59 PM") on screen.
+constexpr int CLOCK_CY = TIME_SPR_Y + TIME_SPR_H / 2;      // digits centre
+constexpr int CLOCK_Y0 = TIME_SPR_Y - 10;                  // scaled region top
+constexpr int CLOCK_Y1 = TIME_SPR_Y + TIME_SPR_H + 10;     // scaled region bottom
+float clockScale = 0;  // computed on first draw (needs font metrics)
+
+void pushTimeSprScaled(float scale, int centerY, int y0, int y1);
+
 void drawTime(const tm &t, bool colonOn) {
   timeSpr.fillSprite(COL_BG);
 
@@ -149,6 +159,14 @@ void drawTime(const tm &t, bool colonOn) {
   timeSpr.setTextFont(4);
   int apW = timeSpr.textWidth(ampm);
   const int gap = 10;
+
+  if (clockScale == 0) {
+    timeSpr.setTextFont(8);
+    int worstW = timeSpr.textWidth("12:59") + gap;
+    timeSpr.setTextFont(4);
+    worstW += timeSpr.textWidth("PM");
+    clockScale = fminf((float)(SCR_W - 2) / worstW, 1.3f);
+  }
 
   int x = (SCR_W - (hhW + coW + mmW + gap + apW)) / 2;
   int yMid = TIME_SPR_H / 2;
@@ -171,7 +189,7 @@ void drawTime(const tm &t, bool colonOn) {
   timeSpr.setTextColor(COL_ACCENT, COL_BG);
   timeSpr.drawString(ampm, x, yMid + 34);
 
-  timeSpr.pushSprite(0, TIME_SPR_Y);
+  pushTimeSprScaled(clockScale, CLOCK_CY, CLOCK_Y0, CLOCK_Y1);
 }
 
 void drawDate(const tm &t) {
@@ -283,16 +301,16 @@ void renderPomoDigits() {
   pomoScaleMax = fminf((float)(SCR_W - 8) / pomoSrcW, 1.6f);
 }
 
-// Push the sprite's digits to the screen scaled about their centre. Output is
-// built one row at a time in a line buffer, so there is still no flicker.
-void drawPomoTimerFrame(float scale, int centerY) {
+// Push the sprite's digits to screen rows [y0, y1) scaled about their centre.
+// Output is built one row at a time in a line buffer, so there is no flicker.
+void pushTimeSprScaled(float scale, int centerY, int y0, int y1) {
   static uint16_t line[SCR_W];
   static int sxMap[SCR_W];
   for (int dx = 0; dx < SCR_W; dx++) {
     int sxi = (int)(SCR_W / 2 + (dx - SCR_W / 2) / scale + 0.5f);
     sxMap[dx] = (sxi >= 0 && sxi < SCR_W) ? sxi : -1;
   }
-  for (int dy = ANIM_Y0; dy < ANIM_Y1; dy++) {
+  for (int dy = y0; dy < y1; dy++) {
     int syi = (int)(TIME_SPR_H / 2 + (dy - centerY) / scale + 0.5f);
     if (syi < 0 || syi >= TIME_SPR_H) {
       for (int dx = 0; dx < SCR_W; dx++) line[dx] = COL_BG;
@@ -302,6 +320,10 @@ void drawPomoTimerFrame(float scale, int centerY) {
     }
     tft.pushImage(0, dy, SCR_W, 1, line);
   }
+}
+
+void drawPomoTimerFrame(float scale, int centerY) {
+  pushTimeSprScaled(scale, centerY, ANIM_Y0, ANIM_Y1);
 }
 
 // Smoothly grow the digits into the chip row's space (or shrink back out of
